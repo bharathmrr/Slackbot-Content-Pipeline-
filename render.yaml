@@ -1,0 +1,48 @@
+# Render.com deployment configuration
+services:
+  - type: web
+    name: slackbot-content-pipeline
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python run_flask.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      # Add your environment variables here
+      - key: SLACK_BOT_TOKEN
+        sync: false  # Set in Render dashboard
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SERP_API_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: FROM_EMAIL
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
+    
+databases:
+  - name: slackbot-redis
+    plan: starter
+    
+  # Note: Use external Supabase for PostgreSQL

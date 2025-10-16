@@ -1,0 +1,161 @@
+name: Docker Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths: [ 'Dockerfile', 'requirements.txt' ]
+  pull_request:
+    branches: [ main ]
+    paths: [ 'Dockerfile', 'requirements.txt' ]
+  schedule:
+    # Run security scan weekly on Sundays at 3 AM UTC
+    - cron: '0 3 * * 0'
+
+jobs:
+  docker-security:
+    name: Docker Security Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker image for scanning
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        load: true
+        tags: slackbot-pipeline:security-scan
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'slackbot-pipeline:security-scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Run Trivy vulnerability scanner (JSON output)
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'slackbot-pipeline:security-scan'
+        format: 'json'
+        output: 'trivy-results.json'
+        
+    - name: Run Docker Scout
+      uses: docker/scout-action@v1
+      with:
+        command: cves
+        image: slackbot-pipeline:security-scan
+        format: sarif
+        output: scout-results.sarif
+      continue-on-error: true
+      
+    - name: Run Snyk Container Security
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        image: slackbot-pipeline:security-scan
+        args: --severity-threshold=medium --file=Dockerfile
+      continue-on-error: true
+      
+    - name: Generate security summary
+      run: |
+        echo "# Docker Security Scan Results" > security-summary.md
+        echo "" >> security-summary.md
+        
+        if [ -f trivy-results.json ]; then
+          echo "## Trivy Scan Results" >> security-summary.md
+          echo "\`\`\`json" >> security-summary.md
+          jq '.Results[] | select(.Vulnerabilities) | {Target, Vulnerabilities: (.Vulnerabilities | length)}' trivy-results.json >> security-summary.md
+          echo "\`\`\`" >> security-summary.md
+          echo "" >> security-summary.md
+        fi
+        
+        echo "## Scan Summary" >> security-summary.md
+        echo "- **Image:** slackbot-pipeline:security-scan" >> security-summary.md
+        echo "- **Scan Date:** $(date)" >> security-summary.md
+        echo "- **Base Image:** python:3.11-slim" >> security-summary.md
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: docker-security-reports
+        path: |
+          trivy-results.*
+          scout-results.sarif
+          security-summary.md
+          
+    - name: Comment PR with security results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = '## 🔒 Docker Security Scan Results\n\n';
+          
+          if (fs.existsSync('trivy-results.json')) {
+            try {
+              const trivyResults = JSON.parse(fs.readFileSync('trivy-results.json', 'utf8'));
+              let totalVulns = 0;
+              let criticalVulns = 0;
+              let highVulns = 0;
+              
+              if (trivyResults.Results) {
+                trivyResults.Results.forEach(result => {
+                  if (result.Vulnerabilities) {
+                    result.Vulnerabilities.forEach(vuln => {
+                      totalVulns++;
+                      if (vuln.Severity === 'CRITICAL') criticalVulns++;
+                      if (vuln.Severity === 'HIGH') highVulns++;
+                    });
+                  }
+                });
+              }
+              
+              comment += `**Total Vulnerabilities:** ${totalVulns}\n`;
+              comment += `**Critical:** ${criticalVulns} | **High:** ${highVulns}\n\n`;
+              
+              if (criticalVulns > 0) {
+                comment += '⚠️ **Critical vulnerabilities found!** Please review and fix before merging.\n\n';
+              } else if (highVulns > 0) {
+                comment += '⚠️ **High severity vulnerabilities found.** Consider fixing before merging.\n\n';
+              } else {
+                comment += '✅ **No critical or high severity vulnerabilities found.**\n\n';
+              }
+            } catch (e) {
+              comment += '❌ **Error parsing security scan results.**\n\n';
+            }
+          }
+          
+          comment += '📋 Full security reports available in artifacts.';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+          
+    - name: Fail on critical vulnerabilities
+      run: |
+        if [ -f trivy-results.json ]; then
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json)
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "❌ Found $CRITICAL_COUNT critical vulnerabilities!"
+            echo "Please fix critical vulnerabilities before proceeding."
+            exit 1
+          fi
+        fi
